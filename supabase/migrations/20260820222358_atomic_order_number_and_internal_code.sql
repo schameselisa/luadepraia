@@ -1,0 +1,155 @@
+/*
+  # Make order number and product code allocation atomic
+
+  1. Problem
+     Both identifiers were derived from a non-atomic read:
+       place_order:            SELECT count(*) + 1 FROM orders
+       generate_internal_code: SELECT count(*) + 1 FROM products WHERE ...
+     Two concurrent transactions read the same count before either committed and
+     both produced the same 'LD-0042' / 'AN-001' value, with no unique
+     constraint to reject the collision.
+
+  2. Changes
+     - Serialize the allocation with a transaction-scoped advisory lock in both
+       functions. The lock is released automatically at commit or rollback.
+     - The generated formats ('LD-0001', 'AN-001') are unchanged.
+*/
+
+CREATE OR REPLACE FUNCTION public.place_order(
+  p_customer_name text,
+  p_customer_email text DEFAULT NULL::text,
+  p_customer_phone text DEFAULT NULL::text,
+  p_items jsonb DEFAULT NULL::jsonb,
+  p_customer_id uuid DEFAULT NULL::uuid
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $function$
+DECLARE
+v_order_id uuid;
+v_number text;
+v_count bigint;
+v_total numeric(10,2) := 0;
+v_item jsonb;
+v_product record;
+v_qty integer;
+v_line_total numeric(10,2);
+v_unit_price numeric(10,2);
+v_customer_id uuid;
+BEGIN
+IF p_items IS NULL OR jsonb_array_length(p_items) = 0 THEN
+RAISE EXCEPTION 'Carrinho vazio';
+END IF;
+
+-- Ownership comes from the session only. p_customer_id is accepted for
+-- backwards compatibility with the existing client call and deliberately
+-- ignored: a caller must not be able to file an order under another account.
+v_customer_id := auth.uid();
+
+-- Serialize order-number allocation so two concurrent checkouts cannot be
+-- assigned the same number. Released automatically at end of transaction.
+PERFORM pg_advisory_xact_lock(hashtext('place_order_number'));
+
+SELECT count(*) + 1 INTO v_count FROM public.orders;
+v_number := 'LD-' || lpad(v_count::text, 4, '0');
+
+INSERT INTO public.orders (number, status, total, customer_name, customer_email, customer_phone, customer_id)
+VALUES (v_number, 'pending', 0, p_customer_name, p_customer_email, p_customer_phone, v_customer_id)
+RETURNING id INTO v_order_id;
+
+FOR v_item IN SELECT jsonb_array_elements(p_items)
+LOOP
+v_qty := (v_item ->> 'quantity')::integer;
+IF v_qty IS NULL OR v_qty < 1 OR v_qty > 100 THEN
+RAISE EXCEPTION 'Quantidade inválida para um produto';
+END IF;
+
+SELECT p.id, p.name, p.price, p.promotional_price, p.stock, p.active, p.deleted_at,
+p.image_url, p.internal_code, c.name AS category_name
+INTO v_product
+FROM public.products p
+LEFT JOIN public.categories c ON c.id = p.category_id
+WHERE p.id = (v_item ->> 'product_id')::uuid;
+
+IF NOT FOUND THEN
+RAISE EXCEPTION 'Produto não encontrado';
+END IF;
+IF v_product.active = false OR v_product.deleted_at IS NOT NULL THEN
+RAISE EXCEPTION 'Produto não disponível: %', v_product.name;
+END IF;
+IF v_product.stock < v_qty THEN
+RAISE EXCEPTION 'Estoque insuficiente para %', v_product.name;
+END IF;
+
+v_unit_price := v_product.price;
+IF v_product.promotional_price IS NOT NULL AND v_product.promotional_price < v_product.price THEN
+v_unit_price := v_product.promotional_price;
+END IF;
+
+v_line_total := v_unit_price * v_qty;
+v_total := v_total + v_line_total;
+
+INSERT INTO public.order_items (
+order_id, product_id, product_name, unit_price, quantity, subtotal,
+product_image_url, product_category_name, product_internal_code
+)
+VALUES (
+v_order_id, v_product.id, v_product.name, v_unit_price, v_qty, v_line_total,
+v_product.image_url, v_product.category_name, v_product.internal_code
+);
+
+UPDATE public.products
+SET stock = stock - v_qty
+WHERE id = v_product.id;
+END LOOP;
+
+UPDATE public.orders SET total = v_total WHERE id = v_order_id;
+
+INSERT INTO public.order_status_history (order_id, status, note)
+VALUES (v_order_id, 'pending', 'Pedido criado pelo site');
+
+RETURN jsonb_build_object('id', v_order_id, 'number', v_number, 'total', v_total);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.generate_internal_code()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $function$
+DECLARE
+v_prefix text;
+v_seq int;
+v_cat_name text;
+BEGIN
+IF NEW.internal_code IS NOT NULL THEN
+RETURN NEW;
+END IF;
+
+SELECT c.name INTO v_cat_name
+FROM public.categories c
+WHERE c.id = NEW.category_id;
+
+v_prefix := CASE
+WHEN v_cat_name ILIKE 'anel%' THEN 'AN'
+WHEN v_cat_name ILIKE 'brinco%' THEN 'BR'
+WHEN v_cat_name ILIKE 'colar%' THEN 'CO'
+WHEN v_cat_name ILIKE 'pulseira%' THEN 'PU'
+ELSE 'XX'
+END;
+
+-- Serialize per-prefix allocation so two concurrent product creations cannot
+-- be assigned the same internal code.
+PERFORM pg_advisory_xact_lock(hashtext('internal_code_' || v_prefix));
+
+SELECT count(*) + 1 INTO v_seq
+FROM public.products
+WHERE internal_code LIKE v_prefix || '-%';
+
+NEW.internal_code := v_prefix || '-' || lpad(v_seq::text, 3, '0');
+RETURN NEW;
+END;
+$function$;
